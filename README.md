@@ -2,6 +2,11 @@
 
 Minimal Android client for Husarnet: `VpnService` + the upstream C++ core via JNI.
 
+> **Made with [Claude Code](https://claude.com/claude-code). Use at your own risk.**
+> This is an experimental, AI-assisted port. It has been tested on a single phone, it has
+> not been security-reviewed, and it comes with no warranty (see `LICENSE`). It runs a VPN
+> on your device, so read the code before you trust it with anything that matters.
+
 ## Build
 
 Patched Husarnet core (upstream d7c3ab0 + `husarnet-android.patch`) is vendored in
