@@ -22,6 +22,18 @@ android {
         }
     }
 
+    // Release signing key lives outside the repo; set these in ~/.gradle/gradle.properties
+    val keystore = providers.gradleProperty("HUSARNET_KEYSTORE").orNull
+    if (keystore != null) {
+        signingConfigs.create("release") {
+            storeFile = file(keystore)
+            storePassword = providers.gradleProperty("HUSARNET_KEYSTORE_PASSWORD").get()
+            keyAlias = providers.gradleProperty("HUSARNET_KEY_ALIAS").get()
+            keyPassword = storePassword
+        }
+        buildTypes.getByName("release").signingConfig = signingConfigs.getByName("release")
+    }
+
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
