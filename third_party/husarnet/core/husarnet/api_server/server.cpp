@@ -1,0 +1,347 @@
+// Copyright (c) 2025 Husarnet sp. z o.o.
+// Authors: listed in project_root/README.md
+// License: specified in project_root/LICENSE.txt
+#include "husarnet/api_server/server.h"
+
+#include <list>
+#include <map>
+#include <utility>
+
+#include <stdlib.h>
+
+#include "husarnet/config_manager.h"
+#include "husarnet/dashboardapi/proxy.h"
+#include "husarnet/husarnet_config.h"
+#include "husarnet/husarnet_manager.h"
+#include "husarnet/ipaddress.h"
+#include "husarnet/logging.h"
+#include "husarnet/peer.h"
+#include "husarnet/peer_container.h"
+#include "husarnet/util.h"
+
+#include "httplib.h"
+#include "nlohmann/json.hpp"
+
+#ifndef HUSARNET_SECRET_HTTP_HEADER_NAME
+#define HUSARNET_SECRET_HTTP_HEADER_NAME "x-husarnet-secret"
+#endif
+
+using namespace nlohmann;  // json
+
+ApiServer::ApiServer(
+    ConfigEnv* configEnv,
+    ConfigManager* configManager,
+    HusarnetManager* husarnetManager,
+    Identity* identity)
+    : configEnv(configEnv), configManager(configManager), husarnetManager(husarnetManager), identity(identity)
+{
+}
+
+void ApiServer::returnSuccess(const httplib::Request& req, httplib::Response& res, json result)
+{
+  json doc;
+
+  doc["status"] = "success";
+  doc["result"] = result;
+
+  res.set_content(doc.dump(4), "text/json");
+}
+
+void ApiServer::returnSuccess(const httplib::Request& req, httplib::Response& res)
+{
+  returnSuccess(req, res, "success");
+}
+
+void ApiServer::returnInvalidQuery(const httplib::Request& req, httplib::Response& res, std::string errorString)
+{
+  HLOG_ERROR("httpApi: returning invalid query // {error}", errorString);
+  json doc;
+
+  doc["status"] = "invalid";
+  doc["error"] = errorString;
+
+  res.set_content(doc.dump(4), "text/json");
+}
+
+void ApiServer::returnError(const httplib::Request& req, httplib::Response& res, std::string errorString)
+{
+  HLOG_ERROR("httpApi: returning error // {error}", errorString.c_str());
+  json doc;
+
+  doc["status"] = "error";
+  doc["error"] = errorString;
+
+  res.set_content(doc.dump(4), "text/json");
+}
+
+static const std::string getOrCreateDaemonApiToken()
+{
+  auto token = Port::readStorage(StorageKey::daemonApiToken);
+  if(token.empty()) {
+    auto newToken = generateRandomString(32);
+    auto success = Port::writeStorage(StorageKey::daemonApiToken, newToken);
+    if(!success) {
+      HLOG_CRITICAL(
+          "Failed to write daemon API token to storage, you won't be able to "
+          "use CLI (or daemon's API) to control the daemon!");
+    }
+    return newToken;
+  }
+  return token;
+}
+
+bool ApiServer::validateSecret(const httplib::Request& req, httplib::Response& res)
+{
+  if(req.has_header(HUSARNET_SECRET_HTTP_HEADER_NAME) &&
+     req.get_header_value(HUSARNET_SECRET_HTTP_HEADER_NAME) == this->daemonApiToken) {
+    return true;
+  }
+
+  if(!req.has_param("secret") || req.get_param_value("secret") != this->daemonApiToken) {
+    returnInvalidQuery(req, res, "invalid control secret");
+    return false;
+  }
+
+  return true;
+}
+
+bool ApiServer::requireParams(const httplib::Request& req, httplib::Response& res, std::list<std::string> paramNames)
+{
+  for(auto paramName : paramNames) {
+    if(!req.has_param(paramName.c_str())) {
+      returnInvalidQuery(req, res, "missing param " + paramName);
+      return false;
+    }
+  }
+  return true;
+}
+
+void ApiServer::forwardRequestToDashboardApi(const httplib::Request& req, httplib::Response& res)
+{
+  HLOG_INFO("received request to forward");
+  if(!validateSecret(req, res)) {
+    return;
+  }
+
+  std::string route = req.matches[1];
+  if(route.empty()) {
+    returnError(req, res, "Invalid route");
+    return;
+  }
+
+  auto method = req.method;
+  auto path = "/" + route;
+  HLOG_INFO("Forwarding request to Dashboard API // {method} {path}", method, path);
+  auto apiAddress = configManager->getApiAddress();
+  if(!apiAddress.isFC94()) {
+    HLOG_WARNING(
+        "Not forwarding the request, as proxy does not have valid "
+        "Dashboard API address");
+
+    // construct response of the same shape as Dashboard API uses
+    nlohmann::json jsonResponse{
+        {"type", "server_error"},
+        {"errors", nlohmann::json::array({"request received by the daemon, but dashboard API "
+                                          "address is not known"})},
+        {"warnings", nlohmann::json::array()},
+        {"message", "error"}};
+
+    res.set_content(jsonResponse.dump(4), "application/json");
+    return;
+  }
+
+  auto encodedPK = dashboardapi::Proxy::encodePublicKey(identity);
+  auto encodedSig = dashboardapi::Proxy::encodeSignature(identity, req.body);
+  httplib::Params params;
+  params.emplace("pk", encodedPK.c_str());
+  params.emplace("sig", encodedSig.c_str());
+
+  std::string query = httplib::detail::params_to_query_str(params);
+  std::string pathWithQuery(path + "?" + query);
+
+  // we allow a couple of retries in case the Dashboard API connection is not well established at the time of Daemon API
+  // request
+  auto attemptRequest = [apiAddress, method, pathWithQuery](const httplib::Request& req) {
+    httplib::Client httpClient(apiAddress.toString());
+    httpClient.set_connection_timeout(5, 0);  // 5 seconds
+    httpClient.set_read_timeout(5, 0);        // 5 seconds
+    httpClient.set_write_timeout(5, 0);       // 5 seconds
+
+    httplib::Result result;
+
+    if(method == "GET") {
+      result = httpClient.Get(pathWithQuery);
+    } else if(method == "POST") {
+      result = httpClient.Post(pathWithQuery, req.body, "application/json");
+    } else if(method == "PUT") {
+      result = httpClient.Put(pathWithQuery, req.body, "application/json");
+    } else if(method == "DELETE") {
+      result = httpClient.Delete(pathWithQuery);
+    } else {
+      HLOG_ERROR("Unsupported HTTP method {method}", method);
+    }
+    return result;
+  };
+
+  const int maxRetries = 3;
+  int retriesLeft = maxRetries;
+
+  httplib::Result attemptResult;
+  while(retriesLeft > 0) {
+    retriesLeft--;
+    attemptResult = attemptRequest(req);
+
+    if(attemptResult) {
+      res.set_content(attemptResult->body,
+                      "application/json");  // Dashboard API always returns valid JSON
+      HLOG_DEBUG("API request successful // {needed_attempts}", maxRetries - retriesLeft);
+      return;
+    }
+    Port::threadSleep(1500);
+  }
+
+  auto err = attemptResult.error();
+  HLOG_ERROR("Can't contact Dashboard API, number of retries exhausted // {error}", httplib::to_string(err));
+  res.status = 503;
+  nlohmann::json jsonResponse{
+      {"type", "server_error"},
+      {"errors", nlohmann::json::array({httplib::to_string(err)})},
+      {"warnings", nlohmann::json::array()},
+      {"message", "error"}};
+  res.set_content(jsonResponse.dump(4), "application/json");
+}
+
+template <typename iterable_InetAddress_t>
+std::list<std::string> stringifyInetAddressList(const iterable_InetAddress_t& source)
+{
+  std::list<std::string> stringified{};
+  std::transform(source.cbegin(), source.cend(), std::back_insert_iterator(stringified), [](const InetAddress element) {
+    return element.str();
+  });
+  return stringified;
+}
+
+template <typename iterable_IpAddress_t>
+std::list<std::string> stringifyIpAddressList(const iterable_IpAddress_t& source)
+{
+  std::list<std::string> stringified{};
+  std::transform(source.cbegin(), source.cend(), std::back_insert_iterator(stringified), [](const IpAddress element) {
+    return element.toString();
+  });
+  return stringified;
+}
+
+void ApiServer::runThread()
+{
+  std::unique_lock<std::mutex> lk(mutex);
+  httplib::Server svr;
+
+  this->daemonApiToken = getOrCreateDaemonApiToken();
+  if(this->daemonApiToken.empty()) {
+    HLOG_ERROR("unable to generate daemon api token");
+  }
+
+  // Test endpoint
+  svr.Get(
+      "/hi", [](const httplib::Request&, httplib::Response& res) { res.set_content("Hello World!", "text/plain"); });
+
+  svr.Get("/api/status", [&](const httplib::Request& req, httplib::Response& res) {
+    returnSuccess(
+        req, res,
+        json::object({
+            {"config", this->configManager->getDataForStatus()},
+            {"live", this->husarnetManager->getDataForStatus()},
+            {"version", HUSARNET_VERSION},
+            {"user_agent", HUSARNET_USER_AGENT},
+        }));
+  });
+
+  svr.Post("/api/whitelist/add", [&](const httplib::Request& req, httplib::Response& res) {
+    if(!validateSecret(req, res)) {
+      return;
+    }
+
+    if(!requireParams(req, res, {"address"})) {
+      return;
+    }
+
+    if(configManager->userWhitelistAdd(IpAddress::parse(req.get_param_value("address")))) {
+      returnSuccess(req, res, {});
+    } else {
+      returnError(req, res, "Failed to add address to whitelist");
+    }
+  });
+
+  svr.Post("/api/whitelist/rm", [&](const httplib::Request& req, httplib::Response& res) {
+    if(!validateSecret(req, res)) {
+      return;
+    }
+
+    if(!requireParams(req, res, {"address"})) {
+      return;
+    }
+
+    if(configManager->userWhitelistRm(IpAddress::parse(req.get_param_value("address")))) {
+      returnSuccess(req, res, {});
+    } else {
+      returnError(req, res, "Failed to remove address from whitelist");
+    }
+  });
+
+  svr.Get(R"(/api/forward/(.*))", [&](const httplib::Request& req, httplib::Response& res) {
+    forwardRequestToDashboardApi(req, res);
+  });
+
+  svr.Post(R"(/api/forward/(.*))", [&](const httplib::Request& req, httplib::Response& res) {
+    forwardRequestToDashboardApi(req, res);
+  });
+
+  svr.Put(R"(/api/forward/(.*))", [&](const httplib::Request& req, httplib::Response& res) {
+    forwardRequestToDashboardApi(req, res);
+  });
+
+  svr.Delete(R"(/api/forward/(.*))", [&](const httplib::Request& req, httplib::Response& res) {
+    forwardRequestToDashboardApi(req, res);
+  });
+
+  IpAddress bindAddress{};
+
+  if(configEnv->getDaemonApiInterface() != "") {
+    // Deduce bind address from the provided interface
+    bindAddress = Port::getIpAddressFromInterfaceName(configEnv->getDaemonApiInterface());
+    HLOG_INFO(
+        "Deducing bind address from the provided interface // {address} {interface}", bindAddress.toString().c_str(),
+        configEnv->getDaemonApiInterface().c_str());
+  } else {
+    // Use provided/default bind address
+    bindAddress = configEnv->getDaemonApiHost();
+  }
+
+  if(!svr.bind_to_port(bindAddress.toString().c_str(), configEnv->getDaemonApiPort())) {
+    HLOG_CRITICAL(
+        "unable to bind HTTP thread to port. Exiting! // {address} {port}", bindAddress.toString().c_str(),
+        configEnv->getDaemonApiPort());
+    exit(1);
+  } else {
+    HLOG_INFO(
+        "HTTP thread bound Will start handling the connections. // {address} {port}", bindAddress.toString().c_str(),
+        configEnv->getDaemonApiPort());
+  }
+
+  isReady = true;
+  lk.unlock();
+  cv.notify_all();
+
+  if(!svr.listen_after_bind()) {
+    HLOG_CRITICAL("HTTP thread finished unexpectedly. Exiting!");
+    exit(1);
+  }
+}
+
+void ApiServer::waitStarted()
+{
+  std::unique_lock<std::mutex> lk(mutex);
+  while(!isReady) {
+    cv.wait(lk);
+  }
+}

@@ -1,0 +1,129 @@
+// Copyright (c) 2025 Husarnet sp. z o.o.
+// Authors: listed in project_root/README.md
+// License: specified in project_root/LICENSE.txt
+#include "husarnet/config_env.h"
+
+#include "husarnet/util.h"
+
+#include "magic_enum/magic_enum.hpp"
+
+static const std::string
+envPresentOrDefault(etl::map<EnvKey, std::string, ENV_KEY_OPTIONS> env, const EnvKey key, const std::string& def)
+{
+  if(env.contains(key)) {
+    return env.at(key);
+  }
+  return def;
+}
+
+ConfigEnv::ConfigEnv()
+{
+  this->env = Port::getEnvironmentDefaultsFromIniFile();
+  auto envOverrides = Port::getEnvironmentOverrides();
+
+  for(const auto& [k, v] : envOverrides) {
+    this->env[k] = v;
+  }
+}
+
+json ConfigEnv::getJson() const
+{
+  json j;
+  j["tldFqdn"] = getTldFqdn();
+  j["logVerbosity"] = magic_enum::enum_name(getLogVerbosity());
+  j["enableHooks"] = getEnableHooks();
+  j["enableControlPlane"] = getEnableControlplane();
+  j["enableJsonLogging"] = getEnableJsonLogging();
+  j["daemonInterface"] = getDaemonInterface();
+  j["daemonApiInterface"] = getDaemonApiInterface();
+  j["daemonApiHost"] = getDaemonApiHost().toString();
+  j["daemonApiPort"] = getDaemonApiPort();
+  return j;
+}
+
+std::string ConfigEnv::getTldFqdn() const
+{
+  return envPresentOrDefault(this->env, EnvKey::tldFqdn, "prod.husarnet.com");
+}
+
+std::string ConfigEnv::getLogVerbosityString() const
+{
+  return std::string(magic_enum::enum_name(this->getLogVerbosity()));
+}
+
+LogLevel ConfigEnv::getLogVerbosity() const
+{
+#if defined(ESP_PLATFORM)
+  LogLevel def = static_cast<LogLevel>(CONFIG_LOG_DEFAULT_LEVEL);
+#elif defined(DEBUG_BUILD)
+  auto def = LogLevel::DEBUG;
+#else
+  auto def = LogLevel::INFO;
+#endif
+
+  if(this->env.contains(EnvKey::logVerbosity)) {
+    auto requested = strToUpper(env.at(EnvKey::logVerbosity));
+    return magic_enum::enum_cast<LogLevel>(requested).value_or(def);
+  }
+
+  return def;
+}
+
+int ConfigEnv::getLogBackendSleepDurationMs() const
+{
+  return std::stoi(envPresentOrDefault(this->env, EnvKey::logBackendSleepDurationMs, "100"));
+}
+
+bool ConfigEnv::getEnableHooks() const
+{
+  return strToBool(envPresentOrDefault(this->env, EnvKey::enableHooks, "false"));
+}
+
+bool ConfigEnv::getEnableControlplane() const
+{
+  return strToBool(envPresentOrDefault(this->env, EnvKey::enableControlPlane, "true"));
+}
+
+bool ConfigEnv::getEnableJsonLogging() const
+{
+  return strToBool(envPresentOrDefault(this->env, EnvKey::enableJsonLogging, "false"));
+}
+
+const std::string ConfigEnv::getDaemonInterface() const
+{
+  return envPresentOrDefault(this->env, EnvKey::daemonInterface, "hnet0");
+}
+
+const std::string ConfigEnv::getDaemonApiInterface() const
+{
+  return envPresentOrDefault(this->env, EnvKey::daemonApiInterface, "");
+}
+
+const InternetAddress ConfigEnv::getDaemonApiHost() const
+{
+  auto def = InternetAddress::parse("127.0.0.1");
+
+  if(this->env.contains(EnvKey::daemonApiHost)) {
+    return InternetAddress::parse(this->env.at(EnvKey::daemonApiHost));  // TODO maybe add a sanity check
+                                                                         // and a nice user-facing message
+  }
+
+  return def;
+}
+
+int ConfigEnv::getDaemonApiPort() const
+{
+  return std::stoi(envPresentOrDefault(this->env, EnvKey::daemonApiPort, "16216"));
+}
+
+int ConfigEnv::getWorkerQueueSize() const
+{
+#if defined(ESP_PLATFORM)
+  constexpr int defaultWorkerQueueSize = 16;
+#else
+  constexpr int defaultWorkerQueueSize = 256;
+#endif
+
+  return std::stoi(
+      envPresentOrDefault(this->env, EnvKey::daemonWorkerQueueSize, std::to_string(defaultWorkerQueueSize)));
+}
