@@ -29,6 +29,8 @@ websocket and join all work. Needed `allowFamily(AF_INET/AF_INET6)` in establish
 Android blocks the core's own IPv4 link to base. Phone -> ESP32 (esp32-arduino-webserver,
 port 80) verified: secure peer link, ping, page loads in the browser via the app's hosts list.
 - Another app set as Always-on VPN makes the consent dialog close instantly (now a toast).
+- Android Auto breaks if it goes through the VPN; it's excluded via addDisallowedApplication
+  (as ZeroTier does). Verified in a car with v0.2.
 - Android Port::init doesn't call fatInit() (it tried to create /var/lib/husarnet/).
 - Hosts list was empty right after joining once; it was populated after an app restart.
   Root cause not found.
